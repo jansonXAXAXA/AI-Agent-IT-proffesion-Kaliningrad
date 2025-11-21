@@ -1,14 +1,20 @@
-
 import json
 import os
 import uuid
 import re
 import asyncio
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 import pandas as pd
 import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
+import hashlib
+import time
+from collections import OrderedDict
+from datetime import datetime, timedelta
+from urllib.parse import urlparse, urlunparse, unquote
+import requests
+from bs4 import BeautifulSoup
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -19,387 +25,13 @@ from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 import logging
 
-import hashlib
-import re
-import time
-import json
-import os
-from collections import OrderedDict
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
-from urllib.parse import urlparse, urlunparse, unquote
-import requests
-from bs4 import BeautifulSoup
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 if not os.path.exists('user_data'):
     os.makedirs('user_data')
 
-DATA_PATH = "data/dataset-it-profession.csv"
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
-
-bot = Bot(token=BOT_TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
-
-class RegistrationStates(StatesGroup):
-    waiting_for_full_name = State()
-    waiting_for_email = State()
-    waiting_for_position = State()
-    waiting_for_search_query = State()
-
-class ITEventSemanticSearch:
-    def __init__(self, csv_path: str):
-        self.csv_path = csv_path
-        self.df = None
-        self.index = None
-        self.model = None
-        self.is_initialized = False
-        
-        try:
-            self._initialize()
-        except Exception as e:
-            logger.error(f"Ошибка при инициализации поиска: {e}")
-    
-    def _initialize(self):
-        logger.info("Загрузка данных и модели для семантического поиска...")
-        
-        self.df = pd.read_csv(self.csv_path, sep=',', encoding='utf-8')
-        
-        text_columns = ['Event Name', 'Description', 'Category', 'Location']
-        for col in text_columns:
-            if col in self.df.columns:
-                self.df[col] = self.df[col].fillna('').astype(str)
-        
-        self.df['search_text'] = (
-            self.df['Event Name'] + ". " +
-            self.df['Description'] + ". " +
-            self.df.get('Category', '') + ". " +
-            self.df.get('Location', '')
-        )
-        
-        self.model = SentenceTransformer('cointegrated/rubert-tiny2')
-        logger.info("Модель загружена успешно")
-        
-        self._build_vector_index()
-        self.is_initialized = True
-        logger.info("Семантический поиск успешно инициализирован")
-    
-    def _build_vector_index(self):
-        texts = self.df['search_text'].tolist()
-        logger.info(f"Создание эмбеддингов для {len(texts)} мероприятий...")
-        
-        embeddings = self.model.encode(texts, batch_size=32, show_progress_bar=False)
-        
-        embeddings = embeddings.astype(np.float32)
-        faiss.normalize_L2(embeddings)
-        
-        dimension = embeddings.shape[1]
-        self.index = faiss.IndexFlatIP(dimension)
-        self.index.add(embeddings)
-        logger.info(f"Индекс создан, добавлено {self.index.ntotal} векторов")
-    
-    def search(self, query: str, top_k: int = 5) -> List[str]:
-        if not self.is_initialized:
-            return ["Сервис поиска временно недоступен. Попробуйте позже."]
-        
-        if not isinstance(query, str) or len(query.strip()) < 2:
-            return ["Пожалуйста, введите запрос длиной не менее 2 символов."]
-        
-        try:
-            query = query.strip()
-            logger.info(f"Поиск по запросу: '{query}'")
-            
-            query_embedding = self.model.encode([query], convert_to_numpy=True)
-            query_embedding = query_embedding.astype(np.float32)
-            faiss.normalize_L2(query_embedding)
-            
-            distances, indices = self.index.search(query_embedding, top_k)
-            
-            results = []
-            seen_events = set()
-            for i, idx in enumerate(indices[0]):
-                if 0 <= idx < len(self.df):
-                    event_info = self.df.iloc[idx]['End Date']
-                    if event_info and event_info not in seen_events:
-                        seen_events.add(event_info)
-                        results.append(f"• {event_info}")
-                        if len(results) >= top_k:
-                            break
-            
-            if not results:
-                return ["По вашему запросу не найдено мероприятий. Попробуйте изменить формулировку."]
-            
-            return results[:top_k]
-        
-        except Exception as e:
-            logger.error(f"Ошибка при поиске: {e}")
-            return ["Произошла ошибка при поиске. Попробуйте позже."]
-
-event_search = ITEventSemanticSearch(DATA_PATH)
-
-def is_valid_email(email):
-    pattern = r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
-    return re.match(pattern, email) is not None
-
-@dp.message(Command("start"))
-async def cmd_start(message: Message, state: FSMContext):
-    user_id = message.from_user.id
-    
-    user_file = f"user_data/user_{user_id}.json"
-    
-    if os.path.exists(user_file):
-        with open(user_file, 'r', encoding='utf-8') as f:
-            user_data = json.load(f)
-        await message.answer(
-            f"Вы уже зарегистрированы!\n\n"
-            f"Ваши данные:\n"
-            f"ФИО: {user_data['full_name']}\n"
-            f"Почта: {user_data['email']}\n"
-            f"Должность: {user_data['position']}\n"
-            f"Уникальный ID: {user_data['unique_id']}\n\n"
-            f"Чтобы найти мероприятия, используйте команду /search или просто напишите ваш запрос."
-        )
-    else:
-        await message.answer("Добро пожаловать! Давайте начнем регистрацию.\n\n"
-                           "Пожалуйста, введите ваше ФИО:")
-        await state.set_state(RegistrationStates.waiting_for_full_name)
-
-@dp.message(RegistrationStates.waiting_for_full_name)
-async def process_full_name(message: Message, state: FSMContext):
-    full_name = message.text.strip()
-    
-    if len(full_name) < 3:
-        await message.answer("ФИО слишком короткое. Пожалуйста, введите корректное ФИО:")
-        return
-    
-    await state.update_data(full_name=full_name)
-    await message.answer("Отлично! Теперь введите ваш email:")
-    await state.set_state(RegistrationStates.waiting_for_email)
-
-@dp.message(RegistrationStates.waiting_for_email)
-async def process_email(message: Message, state: FSMContext):
-    email = message.text.strip()
-    
-    if not is_valid_email(email):
-        await message.answer("Некорректный email. Пожалуйста, введите правильный email:")
-        return
-    
-    await state.update_data(email=email)
-    await message.answer("Отлично! Теперь введите вашу должность:")
-    await state.set_state(RegistrationStates.waiting_for_position)
-
-@dp.message(RegistrationStates.waiting_for_position)
-async def process_position(message: Message, state: FSMContext):
-    position = message.text.strip()
-    
-    if len(position) < 2:
-        await message.answer("Должность слишком короткая. Пожалуйста, введите корректную должность:")
-        return
-    
-    data = await state.get_data()
-    full_name = data['full_name']
-    email = data['email']
-    
-    unique_id = str(uuid.uuid4())
-    
-    user_data = {
-        'user_id': message.from_user.id,
-        'full_name': full_name,
-        'email': email,
-        'position': position,
-        'unique_id': unique_id,
-        'registration_date': message.date.isoformat(),
-        'username': message.from_user.username if message.from_user.username else None
-    }
-    
-    user_file = f"user_data/user_{message.from_user.id}.json"
-    with open(user_file, 'w', encoding='utf-8') as f:
-        json.dump(user_data, f, ensure_ascii=False, indent=2)
-    
-    unique_file = f"user_data/{unique_id}.json"
-    with open(unique_file, 'w', encoding='utf-8') as f:
-        json.dump(user_data, f, ensure_ascii=False, indent=2)
-    
-    await state.clear()
-    
-    welcome_text = (
-        f"Регистрация успешно завершена! 🎉\n\n"
-        f"Ваши данные сохранены:\n"
-        f"ФИО: {full_name}\n"
-        f"Почта: {email}\n"
-        f"Должность: {position}\n\n"
-        f"Уникальный ID: {unique_id}\n\n"
-        f"Теперь вы можете искать IT-мероприятия!\n"
-        f"Используйте команду /search или просто напишите, какие мероприятия вас интересуют.\n\n"
-        f"Примеры запросов:\n"
-        f"• IT конференция в СПбГУ\n"
-        f"• Хакатон по машинному обучению\n"
-        f"• Вебинар по Python\n"
-        f"• Митап по искусственному интеллекту"
-    )
-    
-    await message.answer(welcome_text)
-
-@dp.message(Command("search"))
-async def cmd_search(message: Message, state: FSMContext):
-    user_id = message.from_user.id
-    user_file = f"user_data/user_{user_id}.json"
-    
-    if not os.path.exists(user_file):
-        await message.answer("Для использования поиска необходимо сначала зарегистрироваться. Используйте команду /start")
-        return
-    
-    await message.answer("🔍 Введите ваш запрос для поиска IT-мероприятий:")
-    await state.set_state(RegistrationStates.waiting_for_search_query)
-
-@dp.message()
-async def handle_text_search(message: Message, state: FSMContext):
-    current_state = await state.get_state()
-    
-    if current_state == RegistrationStates.waiting_for_search_query:
-        query = message.text.strip()
-        await state.clear()
-        
-        user_id = message.from_user.id
-        user_file = f"user_data/user_{user_id}.json"
-        
-        if not os.path.exists(user_file):
-            await message.answer("Ошибка: вы не зарегистрированы. Используйте /start")
-            return
-        
-        results = event_search.search(query, top_k=5)
-        
-        response = f"🎯 Результаты поиска по запросу '{query}':\n\n"
-        
-        if results and len(results) > 0:
-            for i, result in enumerate(results, 1):
-                response += f"{i}. {result}\n"
-        else:
-            response += "К сожалению, по вашему запросу не найдено мероприятий."
-        
-        response += "\n\n🔍 Чтобы выполнить новый поиск, используйте команду /search или просто напишите новый запрос."
-        
-        await message.answer(response)
-        return
-    
-    user_id = message.from_user.id
-    user_file = f"user_data/user_{user_id}.json"
-    
-    if not os.path.exists(user_file):
-        await message.answer("Пожалуйста, сначала зарегистрируйтесь с помощью команды /start")
-        return
-    
-    query = message.text.strip()
-    
-    if len(query) < 2:
-        await message.answer("Пожалуйста, введите запрос длиной не менее 2 символов для поиска мероприятий.")
-        return
-    
-    results = event_search.search(query, top_k=5)
-    
-    response = f"🎯 Результаты поиска по запросу '{query}':\n\n"
-    
-    if results and len(results) > 0:
-        for i, result in enumerate(results, 1):
-            response += f"{i}. {result}\n"
-    else:
-        response += "К сожалению, по вашему запросу не найдено мероприятий."
-    
-    response += "\n\n🔍 Чтобы выполнить новый поиск, используйте команду /search или просто напишите новый запрос."
-    
-    await message.answer(response)
-
-@dp.message(Command("mydata"))
-async def cmd_mydata(message: Message):
-    user_id = message.from_user.id
-    user_file = f"user_data/user_{user_id}.json"
-    
-    if os.path.exists(user_file):
-        with open(user_file, 'r', encoding='utf-8') as f:
-            user_data = json.load(f)
-        
-        await message.answer(
-            f"Ваши регистрационные данные:\n\n"
-            f"👤 ФИО: {user_data['full_name']}\n"
-            f"📧 Почта: {user_data['email']}\n"
-            f"💼 Должность: {user_data['position']}\n"
-            f"🆔 Уникальный ID: {user_data['unique_id']}\n"
-            f"📅 Дата регистрации: {user_data['registration_date'][:10]}"
-        )
-    else:
-        await message.answer("Вы не зарегистрированы. Используйте команду /start для регистрации.")
-
-@dp.message(Command("help"))
-async def cmd_help(message: Message):
-    help_text = (
-        "Помощь по боту:\n\n"
-        "🚀 /start - Начать регистрацию или показать данные\n"
-        "🔍 /search - Найти IT-мероприятия\n"
-        "📋 /mydata - Показать ваши регистрационные данные\n"
-        "🆘 /help - Показать эту справку\n\n"
-        "💡 Как использовать поиск:\n"
-        "• Просто напишите ваш запрос в чат\n"
-        "• Или используйте команду /search\n"
-        "• Примеры запросов:\n"
-        "  - IT конференция в СПбГУ\n"
-        "  - Хакатон по машинному обучению\n"
-        "  - Вебинар по Python\n"
-        "  - Митап по AI в Санкт-Петербурге"
-    )
-    await message.answer(help_text)
-
-@dp.message(Command("reregister"))
-async def cmd_reregister(message: Message, state: FSMContext):
-    user_id = message.from_user.id
-    user_file = f"user_data/user_{user_id}.json"
-    
-    if os.path.exists(user_file):
-        os.remove(user_file)
-        await message.answer("Ваши старые данные удалены. Давайте начнем регистрацию заново.\n\nВведите ваше ФИО:")
-        await state.set_state(RegistrationStates.waiting_for_full_name)
-    else:
-        await message.answer("Вы еще не зарегистрированы. Используйте команду /start для регистрации.")
-
-@dp.errors()
-async def error_handler(update, exception):
-    logger.error(f"Произошла ошибка: {exception}")
-    if update.message:
-        await update.message.answer("Произошла ошибка при обработке вашего запроса. Пожалуйста, попробуйте позже.")
-    return True
-
-def get_feed(user_id):
-    user_file = f"user_data/user_{user_id}.json"
-    query = None
-    
-    if os.path.exists(user_file):
-        with open(user_file, 'r', encoding='utf-8') as f:
-            user_data = json.load(f)
-        
-        status = user_data['position']
-        query = f"IT мероприятия для {status} в Санкт-Петербурге"
-
-        SEARCH(query, user_id)
-        recs_file = f"events{user_id}.json"
-
-        with open(recs_file, 'r', encoding='utf-8') as f:
-            recs_data = json.load(f)
-
-async def main():
-    logger.info("Запуск бота...")
-    
-    if not event_search.is_initialized:
-        logger.warning("RAG система не инициализирована. Поиск мероприятий будет недоступен.")
-    
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    import asyncio
-    logger.info("🔧 Инициализация бота...")
-    asyncio.run(main())
-
+# Parser classes and search function moved to top for proper scope
 class DuckDuckGoSearch:
     def __init__(self, cache_size: int = 200, cache_ttl: int = 1800):
         self.cache: OrderedDict = OrderedDict()
@@ -461,7 +93,6 @@ class DuckDuckGoSearch:
         url = "https://html.duckduckgo.com/html/"
         data = {'q': query, 'kl': 'ru-ru', 'df': 'y'}
 
-
         try:
             resp = self.session.post(url, data=data, timeout=15)
             resp.raise_for_status()
@@ -496,7 +127,7 @@ class DuckDuckGoSearch:
             return urls[:10]
 
         except Exception as e:
-            print(f"Search failed: {e}")
+            logger.error(f"Search failed: {e}")
             return []
 
 class EventParser:
@@ -529,7 +160,8 @@ class EventParser:
             if response.encoding is None:
                 response.encoding = 'utf-8'
             return BeautifulSoup(response.text, 'html.parser')
-        except Exception:
+        except Exception as e:
+            logger.error(f"Error fetching {url}: {e}")
             return None
 
     def _get_meta(self, soup: BeautifulSoup, attrs_list: List[Dict]) -> str:
@@ -671,7 +303,7 @@ class JsonWriter:
                         self.data = []
             except (json.JSONDecodeError, Exception):
                 self.data = []
-                print(f"Предупреждение: файл {self.filename} поврежден или пуст. Создается новый.")
+                logger.warning(f"Файл {self.filename} поврежден или пуст. Создается новый.")
     
     def append(self, row: Dict):
         clean_row = {}
@@ -687,57 +319,469 @@ class JsonWriter:
     def save(self):
         with open(self.filename, 'w', encoding='utf-8') as f:
             json.dump(self.data, f, ensure_ascii=False, indent=2)
-        print(f"\nДанные сохранены в {self.filename} ({len(self.data)} записей)")
+        logger.info(f"Данные сохранены в {self.filename} ({len(self.data)} записей)")
 
 def SEARCH(query, user_id):
     today = datetime.now()
+    
+    # Удаляем старый файл, если существует
+    events_file = f"events{user_id}.json"
+    if os.path.exists(events_file):
+        os.remove(events_file)
+        logger.info(f"Удален старый файл мероприятий: {events_file}")
 
     searcher = DuckDuckGoSearch()
     urls = searcher.search(query)
     
     if not urls:
-        print("Ссылки не найдены. Попробуйте изменить запрос или проверить соединение.")
+        logger.warning("Ссылки не найдены. Попробуйте изменить запрос или проверить соединение.")
         return
 
-    print(f"Найдено ссылок: {len(urls)}")
+    logger.info(f"Найдено ссылок: {len(urls)}")
     for i, url in enumerate(urls, 1):
-        print(f"  {i}. {url}")
+        logger.info(f"  {i}. {url}")
     
     parser = EventParser()
-    writer = JsonWriter(f'events{user_id}.json')
+    writer = JsonWriter(events_file)
     
     added_count = 0
     skipped_count = 0
     
     for i, url in enumerate(urls, 1):
         try:
-            print(f"[{i}/{len(urls)}] Обработка: {url}")
+            logger.info(f"[{i}/{len(urls)}] Обработка: {url}")
             event_data = parser.parse(url)
             
             if not event_data['Event Name'] or not parser._is_valid_title(event_data['Event Name']):
-                print(f"  ⚠ Пропуск: некорректное название или кракозябры")
+                logger.warning(f"  ⚠ Пропуск: некорректное название или кракозябры")
                 skipped_count += 1
                 continue
             
             parsed_date = event_data.get('Parsed Date')
             if parsed_date:
                 if parsed_date < today:
-                    print(f"Пропуск: событие прошло ({parsed_date.strftime('%d.%m.%Y')})")
+                    logger.info(f"Пропуск: событие прошло ({parsed_date.strftime('%d.%m.%Y')})")
                     skipped_count += 1
                     continue
                 else:
-                    print(f"  📅 Дата: {parsed_date.strftime('%d.%m.%Y')}")
+                    logger.info(f"  📅 Дата: {parsed_date.strftime('%d.%m.%Y')}")
             else:
-                print(f"Дата не найдена, добавляем с предупреждением")
+                logger.warning(f"Дата не найдена, добавляем с предупреждением")
             
             writer.append(event_data)
             title_display = event_data['Event Name'][:60]
-            print(f"Добавлено: {title_display}...")
+            logger.info(f"Добавлено: {title_display}...")
             added_count += 1
             
             time.sleep(1)
             
         except Exception as e:
-            print(f"Ошибка: {e}")
+            logger.error(f"Ошибка при обработке {url}: {e}")
             skipped_count += 1
+    
     writer.save()
+    logger.info(f"Парсинг завершен. Добавлено: {added_count}, пропущено: {skipped_count}")
+
+DATA_PATH = "data/dataset-it-profession.csv"
+BOT_TOKEN = ""
+
+bot = Bot(token=BOT_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+
+class RegistrationStates(StatesGroup):
+    waiting_for_full_name = State()
+    waiting_for_email = State()
+    waiting_for_position = State()
+    waiting_for_search_query = State()
+
+class ITEventSemanticSearch:
+    def __init__(self, csv_path: str):
+        self.csv_path = csv_path
+        self.df = None
+        self.index = None
+        self.model = None
+        self.is_initialized = False
+        
+        try:
+            self._initialize()
+        except Exception as e:
+            logger.error(f"Ошибка при инициализации поиска: {e}")
+    
+    def _initialize(self):
+        logger.info("Загрузка данных и модели для семантического поиска...")
+        
+        self.df = pd.read_csv(self.csv_path, sep=',', encoding='utf-8')
+        
+        text_columns = ['Event Name', 'Description', 'Category', 'Location']
+        for col in text_columns:
+            if col in self.df.columns:
+                self.df[col] = self.df[col].fillna('').astype(str)
+        
+        self.df['search_text'] = (
+            self.df['Event Name'] + ". " +
+            self.df['Description'] + ". " +
+            self.df.get('Category', '') + ". " +
+            self.df.get('Location', '')
+        )
+        
+        self.model = SentenceTransformer('cointegrated/rubert-tiny2')
+        logger.info("Модель загружена успешно")
+        
+        self._build_vector_index()
+        self.is_initialized = True
+        logger.info("Семантический поиск успешно инициализирован")
+    
+    def _build_vector_index(self):
+        texts = self.df['search_text'].tolist()
+        logger.info(f"Создание эмбеддингов для {len(texts)} мероприятий...")
+        
+        embeddings = self.model.encode(texts, batch_size=32, show_progress_bar=False)
+        
+        embeddings = embeddings.astype(np.float32)
+        faiss.normalize_L2(embeddings)
+        
+        dimension = embeddings.shape[1]
+        self.index = faiss.IndexFlatIP(dimension)
+        self.index.add(embeddings)
+        logger.info(f"Индекс создан, добавлено {self.index.ntotal} векторов")
+    
+    def search(self, query: str, top_k: int = 5) -> List[str]:
+        if not self.is_initialized:
+            return ["Сервис поиска временно недоступен. Попробуйте позже."]
+        
+        if not isinstance(query, str) or len(query.strip()) < 2:
+            return ["Пожалуйста, введите запрос длиной не менее 2 символов."]
+        
+        try:
+            query = query.strip()
+            logger.info(f"Поиск по запросу: '{query}'")
+            
+            query_embedding = self.model.encode([query], convert_to_numpy=True)
+            query_embedding = query_embedding.astype(np.float32)
+            faiss.normalize_L2(query_embedding)
+            
+            distances, indices = self.index.search(query_embedding, top_k)
+            
+            results = []
+            seen_events = set()
+            for i, idx in enumerate(indices[0]):
+                if 0 <= idx < len(self.df):
+                    event_name = self.df.iloc[idx]['Event Name']
+                    event_date = self.df.iloc[idx]['End Date']
+                    event_desc = self.df.iloc[idx]['Description'][:100] + "..." if len(self.df.iloc[idx]['Description']) > 100 else self.df.iloc[idx]['Description']
+                    
+                    if event_name and event_name not in seen_events:
+                        seen_events.add(event_name)
+                        results.append(f"• **{event_name}**\n📅 {event_date}\nℹ️ {event_desc}")
+                        if len(results) >= top_k:
+                            break
+            
+            if not results:
+                return ["По вашему запросу не найдено мероприятий. Попробуйте изменить формулировку."]
+            
+            return results[:top_k]
+        
+        except Exception as e:
+            logger.error(f"Ошибка при поиске: {e}")
+            return ["Произошла ошибка при поиске. Попробуйте позже."]
+
+event_search = ITEventSemanticSearch(DATA_PATH)
+
+def is_valid_email(email):
+    pattern = r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
+    return re.match(pattern, email) is not None
+
+def format_events(events: List[Dict], max_events=5) -> str:
+    """Форматирует список мероприятий для вывода пользователю"""
+    if not events:
+        return "К сожалению, не удалось найти подходящие мероприятия. Попробуйте позже или используйте команду /search."
+    
+    response = "🎉 Вот подборка IT-мероприятий, которые могут вам подойти:\n\n"
+    for i, event in enumerate(events[:max_events], 1):
+        name = event.get('Event Name', 'Без названия')
+        start_date = event.get('Start Date', 'Дата не указана')
+        description = event.get('Description', '')
+        location = event.get('Location', 'Место проведения не указано')
+        
+        # Обрезаем длинные описания
+        if description and len(description) > 150:
+            description = description[:150] + "..."
+        
+        event_text = f"{i}. **{name}**\n"
+        if start_date != 'Дата не указана':
+            event_text += f"📅 {start_date}\n"
+        if location and location != 'Место проведения не указано':
+            event_text += f"📍 {location}\n"
+        if description:
+            event_text += f"ℹ️ {description}\n"
+        event_text += "\n"
+        response += event_text
+    
+    response += "\n🔍 Вы можете найти больше мероприятий с помощью команды /search"
+    return response
+
+@dp.message(Command("start"))
+async def cmd_start(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    
+    user_file = f"user_data/user_{user_id}.json"
+    
+    if os.path.exists(user_file):
+        with open(user_file, 'r', encoding='utf-8') as f:
+            user_data = json.load(f)
+        await message.answer(
+            f"Вы уже зарегистрированы!\n\n"
+            f"Ваши данные:\n"
+            f"ФИО: {user_data['full_name']}\n"
+            f"Почта: {user_data['email']}\n"
+            f"Должность: {user_data['position']}\n"
+            f"Уникальный ID: {user_data['unique_id']}\n\n"
+            f"Чтобы найти мероприятия, используйте команду /search или просто напишите ваш запрос."
+        )
+    else:
+        await message.answer("Добро пожаловать! Давайте начнем регистрацию.\n\n"
+                           "Пожалуйста, введите ваше ФИО:")
+        await state.set_state(RegistrationStates.waiting_for_full_name)
+
+@dp.message(RegistrationStates.waiting_for_full_name)
+async def process_full_name(message: Message, state: FSMContext):
+    full_name = message.text.strip()
+    
+    if len(full_name) < 3:
+        await message.answer("ФИО слишком короткое. Пожалуйста, введите корректное ФИО:")
+        return
+    
+    await state.update_data(full_name=full_name)
+    await message.answer("Отлично! Теперь введите ваш email:")
+    await state.set_state(RegistrationStates.waiting_for_email)
+
+@dp.message(RegistrationStates.waiting_for_email)
+async def process_email(message: Message, state: FSMContext):
+    email = message.text.strip()
+    
+    if not is_valid_email(email):
+        await message.answer("Некорректный email. Пожалуйста, введите правильный email:")
+        return
+    
+    await state.update_data(email=email)
+    await message.answer("Отлично! Теперь введите вашу должность:")
+    await state.set_state(RegistrationStates.waiting_for_position)
+
+@dp.message(RegistrationStates.waiting_for_position)
+async def process_position(message: Message, state: FSMContext):
+    position = message.text.strip()
+    
+    if len(position) < 2:
+        await message.answer("Должность слишком короткая. Пожалуйста, введите корректную должность:")
+        return
+    
+    data = await state.get_data()
+    full_name = data['full_name']
+    email = data['email']
+    
+    unique_id = str(uuid.uuid4())
+    user_id = message.from_user.id
+    
+    user_data = {
+        'user_id': user_id,
+        'full_name': full_name,
+        'email': email,
+        'position': position,
+        'unique_id': unique_id,
+        'registration_date': message.date.isoformat(),
+        'username': message.from_user.username if message.from_user.username else None
+    }
+    
+    user_file = f"user_data/user_{user_id}.json"
+    with open(user_file, 'w', encoding='utf-8') as f:
+        json.dump(user_data, f, ensure_ascii=False, indent=2)
+    
+    unique_file = f"user_data/{unique_id}.json"
+    with open(unique_file, 'w', encoding='utf-8') as f:
+        json.dump(user_data, f, ensure_ascii=False, indent=2)
+    
+    await state.clear()
+    
+    # Генерация персональной ленты мероприятий
+    query = f"IT мероприятия для {position} в Санкт-Петербурге"
+    events_file = f"events{user_id}.json"
+    
+    # Удаляем старый файл, если существует
+    if os.path.exists(events_file):
+        os.remove(events_file)
+    
+    try:
+        # Запускаем парсинг в отдельном потоке для неблокирующего выполнения
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, lambda: SEARCH(query, user_id))
+        
+        # Читаем результаты парсинга
+        if os.path.exists(events_file):
+            with open(events_file, 'r', encoding='utf-8') as f:
+                events = json.load(f)
+            feed_text = format_events(events)
+        else:
+            feed_text = "Не удалось загрузить мероприятия. Попробуйте позже или используйте команду /search."
+    
+    except Exception as e:
+        logger.error(f"Ошибка при генерации фида: {e}")
+        feed_text = "Произошла ошибка при подборе мероприятий. Попробуйте позже или используйте команду /search."
+    
+    welcome_text = (
+        f"Регистрация успешно завершена! 🎉\n\n"
+        f"Ваши данные сохранены:\n"
+        f"ФИО: {full_name}\n"
+        f"Почта: {email}\n"
+        f"Должность: {position}\n\n"
+        f"Уникальный ID: {unique_id}\n\n"
+        f"Теперь вы можете искать IT-мероприятия!\n"
+        f"Используйте команду /search или просто напишите, какие мероприятия вас интересуют.\n\n"
+        f"Примеры запросов:\n"
+        f"• IT конференция в СПбГУ\n"
+        f"• Хакатон по машинному обучению\n"
+        f"• Вебинар по Python\n"
+        f"• Митап по искусственному интеллекту\n\n"
+        f"{feed_text}"
+    )
+    
+    await message.answer(welcome_text, parse_mode="Markdown")
+
+@dp.message(Command("search"))
+async def cmd_search(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    user_file = f"user_data/user_{user_id}.json"
+    
+    if not os.path.exists(user_file):
+        await message.answer("Для использования поиска необходимо сначала зарегистрироваться. Используйте команду /start")
+        return
+    
+    await message.answer("🔍 Введите ваш запрос для поиска IT-мероприятий:")
+    await state.set_state(RegistrationStates.waiting_for_search_query)
+
+@dp.message()
+async def handle_text_search(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    
+    if current_state == RegistrationStates.waiting_for_search_query:
+        query = message.text.strip()
+        await state.clear()
+        
+        user_id = message.from_user.id
+        user_file = f"user_data/user_{user_id}.json"
+        
+        if not os.path.exists(user_file):
+            await message.answer("Ошибка: вы не зарегистрированы. Используйте /start")
+            return
+        
+        results = event_search.search(query, top_k=5)
+        
+        response = f"🎯 Результаты поиска по запросу '{query}':\n\n"
+        
+        if results and len(results) > 0:
+            for i, result in enumerate(results, 1):
+                response += f"{i}. {result}\n\n"
+        else:
+            response += "К сожалению, по вашему запросу не найдено мероприятий."
+        
+        response += "\n\n🔍 Чтобы выполнить новый поиск, используйте команду /search или просто напишите новый запрос."
+        
+        await message.answer(response, parse_mode="Markdown")
+        return
+    
+    user_id = message.from_user.id
+    user_file = f"user_data/user_{user_id}.json"
+    
+    if not os.path.exists(user_file):
+        await message.answer("Пожалуйста, сначала зарегистрируйтесь с помощью команды /start")
+        return
+    
+    query = message.text.strip()
+    
+    if len(query) < 2:
+        await message.answer("Пожалуйста, введите запрос длиной не менее 2 символов для поиска мероприятий.")
+        return
+    
+    results = event_search.search(query, top_k=5)
+    
+    response = f"🎯 Результаты поиска по запросу '{query}':\n\n"
+    
+    if results and len(results) > 0:
+        for i, result in enumerate(results, 1):
+            response += f"{i}. {result}\n\n"
+    else:
+        response += "К сожалению, по вашему запросу не найдено мероприятий."
+    
+    response += "\n\n🔍 Чтобы выполнить новый поиск, используйте команду /search или просто напишите новый запрос."
+    
+    await message.answer(response, parse_mode="Markdown")
+
+@dp.message(Command("mydata"))
+async def cmd_mydata(message: Message):
+    user_id = message.from_user.id
+    user_file = f"user_data/user_{user_id}.json"
+    
+    if os.path.exists(user_file):
+        with open(user_file, 'r', encoding='utf-8') as f:
+            user_data = json.load(f)
+        
+        await message.answer(
+            f"Ваши регистрационные данные:\n\n"
+            f"👤 ФИО: {user_data['full_name']}\n"
+            f"📧 Почта: {user_data['email']}\n"
+            f"💼 Должность: {user_data['position']}\n"
+            f"🆔 Уникальный ID: {user_data['unique_id']}\n"
+            f"📅 Дата регистрации: {user_data['registration_date'][:10]}"
+        )
+    else:
+        await message.answer("Вы не зарегистрированы. Используйте команду /start для регистрации.")
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    help_text = (
+        "Помощь по боту:\n\n"
+        "🚀 /start - Начать регистрацию или показать данные\n"
+        "🔍 /search - Найти IT-мероприятия\n"
+        "📋 /mydata - Показать ваши регистрационные данные\n"
+        "🆘 /help - Показать эту справку\n\n"
+        "💡 Как использовать поиск:\n"
+        "• Просто напишите ваш запрос в чат\n"
+        "• Или используйте команду /search\n"
+        "• Примеры запросов:\n"
+        "  - IT конференция в СПбГУ\n"
+        "  - Хакатон по машинному обучению\n"
+        "  - Вебинар по Python\n"
+        "  - Митап по AI в Санкт-Петербурге"
+    )
+    await message.answer(help_text)
+
+@dp.message(Command("reregister"))
+async def cmd_reregister(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    user_file = f"user_data/user_{user_id}.json"
+    
+    if os.path.exists(user_file):
+        os.remove(user_file)
+        await message.answer("Ваши старые данные удалены. Давайте начнем регистрацию заново.\n\nВведите ваше ФИО:")
+        await state.set_state(RegistrationStates.waiting_for_full_name)
+    else:
+        await message.answer("Вы еще не зарегистрированы. Используйте команду /start для регистрации.")
+
+@dp.errors()
+async def error_handler(update, exception):
+    logger.error(f"Произошла ошибка: {exception}")
+    if update.message:
+        await update.message.answer("Произошла ошибка при обработке вашего запроса. Пожалуйста, попробуйте позже.")
+    return True
+
+async def main():
+    logger.info("Запуск бота...")
+    
+    if not event_search.is_initialized:
+        logger.warning("RAG система не инициализирована. Поиск мероприятий будет недоступен.")
+    
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    logger.info("🔧 Инициализация бота...")
+    asyncio.run(main())
