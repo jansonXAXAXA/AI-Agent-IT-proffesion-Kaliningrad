@@ -1,0 +1,13 @@
+llama-cpp-python
+nltk
+typing
+requests
+tldextract
+psutil
+sentence_transformers
+numpy
+pandas
+faiss-cpu
+aiogram
+dotenv
+bs4
