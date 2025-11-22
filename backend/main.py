@@ -14,6 +14,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 from parser import GET_EVENTS
 from RAG import run_RAG
+from config import config
 
 load_dotenv()
 
@@ -24,8 +25,8 @@ MANAGING_POSITIONS = [
     "владелец", "собственник", "founder", "основатель"
 ]
 
-DB_PATH = str(os.getenv("DB_PATH"))
-BOT_TOKEN = str(os.getenv("BOT_TOKEN"))
+DB_PATH = config.DATABASE_PATH
+BOT_TOKEN = config.TELEGRAM_BOT_TOKEN
 
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
