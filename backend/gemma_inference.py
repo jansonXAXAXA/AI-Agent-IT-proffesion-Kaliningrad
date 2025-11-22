@@ -8,6 +8,7 @@ from typing import List, Dict, Optional
 import llama_cpp
 from llama_cpp import Llama
 import warnings
+from config import config
 warnings.filterwarnings("ignore")
 
 logging.basicConfig(
@@ -20,8 +21,10 @@ logger.propagate = False
 
 logging.getLogger("llama_cpp").setLevel(logging.WARNING)
 
+MODEL_PATH = config.MODEL_PATH
+
 class FixedGemmaEngine:  
-    def __init__(self, model_path: str = "gemma-3-1b-it-Q4_K_M.gguf"):
+    def __init__(self, model_path: str = MODEL_PATH):
         self.model_path = model_path
         self.n_threads = min(4, max(1, psutil.cpu_count(logical=False) or 4))
         self.max_context_size = 8192  
