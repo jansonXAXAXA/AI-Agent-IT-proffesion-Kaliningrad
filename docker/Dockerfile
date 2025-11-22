@@ -34,7 +34,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Copy application code
 COPY backend/ backend/
 COPY data/ data/
-COPY gemma-3-1b-it-Q4_K_M.gguf
+COPY gemma-3-1b-it-Q4_K_M.gguf gemma-3-1b-it-Q4_K_M.gguf
 
 
 # Create necessary directories
