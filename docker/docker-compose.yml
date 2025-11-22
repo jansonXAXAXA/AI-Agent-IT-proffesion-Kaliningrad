@@ -1,0 +1,48 @@
+version: '3.9'
+
+services:
+  bot:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: eventscan-bot
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    volumes:
+      - ../data:/app/data:rw
+      - ../models:/app/models:ro
+      - ../logs:/app/logs:rw
+    environment:
+      - PYTHONPATH=/app
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - DATABASE_PATH=/app/data/company_users.db
+      - DATASET_PATH=/app/data/dataset-it-profession.csv
+      - MODEL_PATH=/app/models/gemma-3-1b-it-Q4_K_M.gguf
+      - LOG_LEVEL=INFO
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  watchtower:
+    image: containrrr/watchtower
+    container_name: watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - WATCHTOWER_POLL_INTERVAL=3600
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_REMOVE_VOLUMES=false
+    command: --schedule "0 0 4 * * *" --cleanup eventscan-bot
+
+networks:
+  default:
+    driver: bridge
